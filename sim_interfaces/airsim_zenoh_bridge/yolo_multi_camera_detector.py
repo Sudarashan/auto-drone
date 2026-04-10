@@ -46,8 +46,13 @@ except ImportError:
     print("WARNING: ultralytics not installed. Install with: pip install ultralytics>=8.1.0")
 
 from data_types import (
-    ImageData, Detection, DetectionList, DetectorConfig, CameraDetectionList
+    ImageData, Detection, DetectionList, DetectorConfig, CameraDetectionList, CameraTrackList
 )
+
+try:
+    from mission_framework.tracker import SimpleByteTrack, TrackerConfig
+except ImportError:
+    from packages.mission_framework.tracker import SimpleByteTrack, TrackerConfig
 
 
 @dataclass
@@ -231,10 +236,12 @@ class YoloMultiCameraDetector:
         self.cameras = cameras or ["front"]
         self.camera_configs: Dict[str, CameraConfig] = {}
         self.camera_processors: Dict[str, CameraProcessor] = {}
+        self.trackers: Dict[str, SimpleByteTrack] = {}
 
         # Model (shared across cameras for efficiency)
         self.model: Optional[YOLO] = None
         self.model_ready = False
+        self.enable_tracker = False
 
         # Processing mode
         self.sequential_mode = True  # Process cameras sequentially (saves GPU memory)
@@ -290,6 +297,15 @@ class YoloMultiCameraDetector:
             self.camera_configs[cam_id] = config
             self.camera_processors[cam_id] = CameraProcessor(
                 config, self.model, self.detection_config
+            )
+            self.trackers[cam_id] = SimpleByteTrack(
+                TrackerConfig(
+                    high_thresh=max(self.detection_config.confidence_threshold, 0.35),
+                    low_thresh=0.10,
+                    match_iou_thresh=0.25,
+                    max_time_lost=15,
+                    min_hits=1,
+                )
             )
 
             print(f"  Camera '{cam_id}': prompts={config.prompts}")
@@ -358,6 +374,11 @@ class YoloMultiCameraDetector:
         topic = f"robot/{self.robot_id}/perception/detections/{camera_id}"
         self.session.put(topic, detections.serialize())
 
+    def publish_tracks(self, camera_id: str, tracks: CameraTrackList):
+        """Publish tracked objects for a camera."""
+        topic = f"robot/{self.robot_id}/perception/tracks/{camera_id}"
+        self.session.put(topic, tracks.serialize())
+
     def run(self):
         """Main processing loop."""
         self.running = True
@@ -385,6 +406,29 @@ class YoloMultiCameraDetector:
             # Publish detections
             for cam_id, detections in all_detections.items():
                 self.publish_detections(cam_id, detections)
+                if self.enable_tracker:
+                    track_start = time.perf_counter()
+                    tracked_objects = self.trackers[cam_id].update(
+                        detections.detections,
+                        detections.image_width,
+                        detections.image_height,
+                        detections.timestamp_us / 1_000_000.0,
+                    )
+                    tracking_time_ms = (time.perf_counter() - track_start) * 1000.0
+                    self.publish_tracks(
+                        cam_id,
+                        CameraTrackList(
+                            timestamp_us=detections.timestamp_us,
+                            frame_id=detections.frame_id,
+                            image_width=detections.image_width,
+                            image_height=detections.image_height,
+                            tracking_time_ms=tracking_time_ms,
+                            camera_id=detections.camera_id,
+                            camera_position=detections.camera_position,
+                            camera_orientation=detections.camera_orientation,
+                            tracks=tracked_objects,
+                        ),
+                    )
                 frames_since_status += 1
 
             self.total_frames += len(all_detections)
@@ -457,6 +501,8 @@ Examples:
                        help="Target FPS")
     parser.add_argument("--device", default="",
                        help="Device: '' (auto), 'cpu', 'cuda', 'mps'")
+    parser.add_argument("--enable-tracker", action="store_true",
+                       help="Run a lightweight ByteTrack-style tracker per camera and publish track topics")
 
     # Per-camera prompts
     parser.add_argument("--front-prompts", nargs="+",
@@ -493,6 +539,7 @@ Examples:
     )
 
     detector.detection_config.target_fps = args.fps
+    detector.enable_tracker = args.enable_tracker
 
     # Load model
     if not detector.load_model():

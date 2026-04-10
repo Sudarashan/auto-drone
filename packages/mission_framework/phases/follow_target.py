@@ -57,6 +57,7 @@ class FollowTargetPhase(MissionPhase):
         min_conf = float(self.config.get("min_confidence", 0.25))
         detection_max_age_s = float(self.config.get("detection_max_age_s", 0.5))
         lost_timeout_s = float(self.config.get("lost_timeout_s", 2.0))
+        reset_track_after_loss = bool(self.config.get("reset_track_after_loss", False))
 
         desired_area = float(self.config.get("desired_area", 12000.0))
         area_tolerance = float(self.config.get("area_tolerance_ratio", 0.15))
@@ -90,10 +91,12 @@ class FollowTargetPhase(MissionPhase):
 
         start = time.monotonic()
         last_seen = start
+        locked_track_id = None
 
         metrics = {
             "target_class": target_class,
             "duration_s": duration_s,
+            "selected_track_id": None,
             "frames_tracked": 0,
             "frames_no_target": 0,
             "max_lost_streak_s": 0.0,
@@ -173,13 +176,26 @@ class FollowTargetPhase(MissionPhase):
                     data=metrics,
                 )
 
-            cam_id, det = self.detection.get_best_detection(target_class, max_age=detection_max_age_s)
-            if det is None or det.confidence < min_conf:
+            cam_id, track = self.detection.get_best_track(
+                target_class,
+                max_age=detection_max_age_s,
+                track_id=locked_track_id,
+            )
+            if track is None and locked_track_id is None:
+                cam_id, track = self.detection.get_best_track(target_class, max_age=detection_max_age_s)
+                if track is not None:
+                    locked_track_id = track.track_id
+                    metrics["selected_track_id"] = locked_track_id
+                    print(f"\n  Locked track_id={locked_track_id} ({track.class_name})")
+
+            if track is None or track.confidence < min_conf:
                 self.drone.hover()
                 metrics["frames_no_target"] += 1
                 lost_for = time.monotonic() - last_seen
                 metrics["max_lost_streak_s"] = max(metrics["max_lost_streak_s"], lost_for)
                 prev_cmd = None
+                if reset_track_after_loss and lost_for > lost_timeout_s:
+                    locked_track_id = None
 
                 if lost_for > lost_timeout_s:
                     finalize_metrics(elapsed)
@@ -187,7 +203,7 @@ class FollowTargetPhase(MissionPhase):
                     export_metrics()
                     return PhaseResult(
                         status=PhaseStatus.FAILED,
-                        message=f"Lost target for {lost_for:.1f}s (> {lost_timeout_s:.1f}s)",
+                        message=f"Lost track_id={locked_track_id} for {lost_for:.1f}s (> {lost_timeout_s:.1f}s)",
                         data=metrics,
                     )
                 await asyncio.sleep(0.1)
@@ -196,9 +212,13 @@ class FollowTargetPhase(MissionPhase):
             last_seen = time.monotonic()
             metrics["frames_tracked"] += 1
 
-            bearing_x = float(det.bearing_x)
-            bearing_y = float(det.bearing_y)
-            area = max(float(det.area), 1.0)
+            if locked_track_id is None:
+                locked_track_id = track.track_id
+                metrics["selected_track_id"] = locked_track_id
+
+            bearing_x = float(track.bearing_x)
+            bearing_y = float(track.bearing_y)
+            area = max(float(track.area), 1.0)
 
             area_error_ratio = (desired_area - area) / desired_area
             if abs(area_error_ratio) < area_tolerance:
@@ -230,7 +250,7 @@ class FollowTargetPhase(MissionPhase):
             prev_cmd = cmd
 
             print(
-                f"  [{cam_id}] t={elapsed:5.1f}s conf={det.confidence:.2f} "
+                f"  [{cam_id}] t={elapsed:5.1f}s track={track.track_id:03d} conf={track.confidence:.2f} "
                 f"area={area:7.0f} vx={vx:+.2f} vz={vz:+.2f} yaw={yaw_rate:+.2f}",
                 end="\r",
             )

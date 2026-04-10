@@ -53,6 +53,23 @@ def _build_target_state(trajectory: str, t: float) -> tuple[float, float, int]:
     return bearing_x, bearing_y, max(area, 3000)
 
 
+def _offset_target_state(
+    bearing_x: float,
+    bearing_y: float,
+    area: int,
+    target_index: int,
+) -> tuple[float, float, int]:
+    """Apply a deterministic offset so each synthetic target occupies its own path."""
+    if target_index == 0:
+        return bearing_x, bearing_y, area
+
+    offset = 0.26 * target_index
+    shifted_x = max(-0.95, min(0.95, -bearing_x * 0.8 + offset - 0.13))
+    shifted_y = max(-0.85, min(0.85, bearing_y * 0.7 - 0.10 * target_index))
+    scaled_area = max(int(area * (0.82 - 0.10 * min(target_index, 3))), 1400)
+    return shifted_x, shifted_y, scaled_area
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Mock detection publisher")
     parser.add_argument("--connect", type=str, default="tcp/127.0.0.1:7447", help="Zenoh endpoint")
@@ -67,6 +84,12 @@ def main() -> int:
                         help="Named sensor noise profile applied to both bearing and area noise")
     parser.add_argument("--trajectory", choices=TRAJECTORIES, default="oscillate",
                         help="Target motion profile")
+    parser.add_argument("--num-targets", type=int, default=1,
+                        help="Number of synthetic targets to publish per frame")
+    parser.add_argument("--secondary-class", type=str, default="orange cone",
+                        help="Class name to use for non-primary targets when not using same class")
+    parser.add_argument("--same-class-secondary", action="store_true",
+                        help="Use the primary target class for all synthetic targets")
     parser.add_argument("--latency-ms", type=float, default=0.0,
                         help="Fixed publish latency in milliseconds")
     parser.add_argument("--dropout-burst-prob", type=float, default=0.0,
@@ -75,6 +98,10 @@ def main() -> int:
                         help="Minimum dropout burst duration in seconds")
     parser.add_argument("--dropout-burst-max-s", type=float, default=2.0,
                         help="Maximum dropout burst duration in seconds")
+    parser.add_argument("--occlusion-start-s", type=float, default=-1.0,
+                        help="Optional time (seconds) to hide the primary target")
+    parser.add_argument("--occlusion-duration-s", type=float, default=0.0,
+                        help="Occlusion duration for the primary target in seconds")
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed for reproducible runs")
     args = parser.parse_args()
 
@@ -130,20 +157,45 @@ def main() -> int:
             bbox_x = max(center_x - bbox_w // 2, 0)
             bbox_y = max(center_y - bbox_h // 2, 0)
 
-            det = Detection(
-                class_id=0,
-                class_name=args.target_class,
-                confidence=0.92,
-                bbox_x=bbox_x,
-                bbox_y=bbox_y,
-                bbox_w=bbox_w,
-                bbox_h=bbox_h,
-                center_x=center_x,
-                center_y=center_y,
-                area=area,
-                bearing_x=bearing_x,
-                bearing_y=bearing_y,
+            detections = []
+            occlusion_active = (
+                args.occlusion_start_s >= 0.0
+                and args.occlusion_duration_s > 0.0
+                and args.occlusion_start_s <= t < (args.occlusion_start_s + args.occlusion_duration_s)
             )
+
+            for target_index in range(max(args.num_targets, 1)):
+                tx, ty, ta = _offset_target_state(bearing_x, bearing_y, area, target_index)
+                target_center_x = int(width * (0.5 + 0.5 * tx))
+                target_center_y = int(height * (0.5 + 0.5 * ty))
+                target_bbox_w = int(math.sqrt(ta))
+                target_bbox_h = int(math.sqrt(ta))
+                target_bbox_x = max(target_center_x - target_bbox_w // 2, 0)
+                target_bbox_y = max(target_center_y - target_bbox_h // 2, 0)
+
+                if target_index == 0 and occlusion_active:
+                    continue
+
+                class_name = args.target_class
+                if target_index > 0 and not args.same_class_secondary:
+                    class_name = args.secondary_class
+
+                detections.append(
+                    Detection(
+                        class_id=target_index,
+                        class_name=class_name,
+                        confidence=max(0.35, 0.92 - 0.08 * target_index),
+                        bbox_x=target_bbox_x,
+                        bbox_y=target_bbox_y,
+                        bbox_w=target_bbox_w,
+                        bbox_h=target_bbox_h,
+                        center_x=target_center_x,
+                        center_y=target_center_y,
+                        area=ta,
+                        bearing_x=tx,
+                        bearing_y=ty,
+                    )
+                )
             msg = CameraDetectionList(
                 timestamp_us=int(now * 1_000_000),
                 frame_id=frame_id,
@@ -153,7 +205,7 @@ def main() -> int:
                 camera_id=args.camera,
                 camera_position=(0.3, 0.0, -0.05),
                 camera_orientation=(0.0, -15.0, 0.0),
-                detections=[det],
+                detections=detections,
             )
 
             should_publish = True
@@ -177,7 +229,7 @@ def main() -> int:
             if frame_id % 20 == 0:
                 print(
                     f"frame={frame_id:04d} traj={args.trajectory:>10} area={area:5d} "
-                    f"bearing=({bearing_x:+.2f}, {bearing_y:+.2f})",
+                    f"bearing=({bearing_x:+.2f}, {bearing_y:+.2f}) targets={len(detections)}",
                     end="\r",
                 )
             frame_id += 1

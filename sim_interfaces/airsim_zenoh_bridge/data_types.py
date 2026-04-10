@@ -470,3 +470,121 @@ class CameraDetectionList(DetectionList):
             camera_orientation=tuple(data.get('camera_orientation', (0, 0, 0))),
             detections=detections
         )
+
+
+@dataclass
+class TrackedObject:
+    """
+    Single tracked object with persistent identity across frames.
+
+    This mirrors the detection payload plus tracker-specific metadata so the
+    rest of the mission pipeline can transition from raw detections to tracks
+    without extra shape conversions.
+    """
+    track_id: int
+    class_id: int
+    class_name: str
+    confidence: float
+
+    bbox_x: int
+    bbox_y: int
+    bbox_w: int
+    bbox_h: int
+
+    center_x: int = 0
+    center_y: int = 0
+    area: int = 0
+
+    bearing_x: float = 0.0
+    bearing_y: float = 0.0
+
+    age: int = 1
+    time_since_seen: int = 0
+    velocity_estimate_x: float = 0.0
+    velocity_estimate_y: float = 0.0
+
+    def __post_init__(self):
+        """Compute derived fields when omitted by the producer."""
+        if self.center_x == 0 and self.bbox_w > 0:
+            self.center_x = self.bbox_x + self.bbox_w // 2
+        if self.center_y == 0 and self.bbox_h > 0:
+            self.center_y = self.bbox_y + self.bbox_h // 2
+        if self.area == 0:
+            self.area = self.bbox_w * self.bbox_h
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'TrackedObject':
+        """Create from dictionary."""
+        return cls(**d)
+
+
+@dataclass
+class CameraTrackList:
+    """
+    Tracked objects from a specific camera.
+
+    Published on:
+      robot/{id}/perception/tracks/{camera_id}
+    """
+    timestamp_us: int
+    frame_id: int
+    image_width: int
+    image_height: int
+    tracking_time_ms: float
+    camera_id: str = ""
+    camera_position: tuple = (0.0, 0.0, 0.0)
+    camera_orientation: tuple = (0.0, 0.0, 0.0)
+    tracks: List[TrackedObject] = field(default_factory=list)
+
+    def serialize(self) -> bytes:
+        """Serialize to JSON bytes with camera metadata."""
+        data = {
+            'timestamp_us': self.timestamp_us,
+            'frame_id': self.frame_id,
+            'image_width': self.image_width,
+            'image_height': self.image_height,
+            'tracking_time_ms': self.tracking_time_ms,
+            'camera_id': self.camera_id,
+            'camera_position': list(self.camera_position),
+            'camera_orientation': list(self.camera_orientation),
+            'tracks': [t.to_dict() for t in self.tracks]
+        }
+        return json.dumps(data).encode('utf-8')
+
+    @classmethod
+    def deserialize(cls, payload: bytes) -> 'CameraTrackList':
+        """Deserialize from JSON bytes."""
+        data = json.loads(payload.decode('utf-8'))
+        tracks = [TrackedObject.from_dict(t) for t in data.get('tracks', [])]
+        return cls(
+            timestamp_us=data['timestamp_us'],
+            frame_id=data['frame_id'],
+            image_width=data['image_width'],
+            image_height=data['image_height'],
+            tracking_time_ms=data.get('tracking_time_ms', 0.0),
+            camera_id=data.get('camera_id', ''),
+            camera_position=tuple(data.get('camera_position', (0, 0, 0))),
+            camera_orientation=tuple(data.get('camera_orientation', (0, 0, 0))),
+            tracks=tracks
+        )
+
+    def get_by_class(self, class_name: str) -> List[TrackedObject]:
+        """Filter tracks by class name (case-insensitive)."""
+        class_lower = class_name.lower()
+        return [t for t in self.tracks if t.class_name.lower() == class_lower]
+
+    def get_by_track_id(self, track_id: int) -> Optional[TrackedObject]:
+        """Get a specific persistent track by ID."""
+        for track in self.tracks:
+            if track.track_id == track_id:
+                return track
+        return None
+
+    def get_best(self, class_name: str) -> Optional[TrackedObject]:
+        """Get highest confidence track of given class."""
+        matches = self.get_by_class(class_name)
+        return max(matches, key=lambda t: t.confidence) if matches else None

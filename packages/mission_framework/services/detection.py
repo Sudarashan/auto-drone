@@ -13,12 +13,14 @@ import zenoh
 
 # Import data types (in sim_interfaces/airsim_zenoh_bridge/)
 try:
-    from data_types import DetectionList, CameraDetectionList, Detection
+    from data_types import DetectionList, CameraDetectionList, CameraTrackList, Detection, TrackedObject
 except ImportError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "sim_interfaces" / "airsim_zenoh_bridge"))
-    from data_types import DetectionList, CameraDetectionList, Detection
+    from data_types import DetectionList, CameraDetectionList, CameraTrackList, Detection, TrackedObject
+
+from ..tracker import SimpleByteTrack, TrackerConfig
 
 if TYPE_CHECKING:
     from ..state import MissionState
@@ -86,27 +88,47 @@ class DetectionService:
         self._detections: Dict[str, Optional[CameraDetectionList]] = {}
         self._locks: Dict[str, Lock] = {}
         self._timestamps: Dict[str, float] = {}
+        self._tracks: Dict[str, Optional[CameraTrackList]] = {}
+        self._track_timestamps: Dict[str, float] = {}
+        self._track_publishers: Dict[str, zenoh.Publisher] = {}
+        self._trackers: Dict[str, SimpleByteTrack] = {}
         for cam in self.cameras:
             self._detections[cam] = None
             self._locks[cam] = Lock()
             self._timestamps[cam] = 0.0
+            self._tracks[cam] = None
+            self._track_timestamps[cam] = 0.0
+            self._trackers[cam] = SimpleByteTrack(
+                TrackerConfig(
+                    high_thresh=0.45,
+                    low_thresh=0.10,
+                    match_iou_thresh=0.25,
+                    max_time_lost=15,
+                    min_hits=1,
+                )
+            )
 
         # Subscribers
         self._subs = []
 
         # Statistics
         self.detection_counts: Dict[str, int] = {cam: 0 for cam in self.cameras}
+        self.track_counts: Dict[str, int] = {cam: 0 for cam in self.cameras}
+        self.tracker_latency_ms: Dict[str, float] = {cam: 0.0 for cam in self.cameras}
 
     async def start(self) -> None:
         """Start the service - subscribe to detection topics."""
         for camera_id in self.cameras:
             topic = f"robot/{self.robot_id}/perception/detections/{camera_id}"
+            track_topic = f"robot/{self.robot_id}/perception/tracks/{camera_id}"
             sub = self.session.declare_subscriber(
                 topic,
                 lambda sample, cid=camera_id: self._on_detection(sample, cid)
             )
             self._subs.append(sub)
+            self._track_publishers[camera_id] = self.session.declare_publisher(track_topic)
             print(f"  DetectionService: subscribed to {topic}")
+            print(f"  DetectionService: publishing to {track_topic}")
 
     async def stop(self) -> None:
         """Stop the service."""
@@ -117,10 +139,7 @@ class DetectionService:
         try:
             # Try CameraDetectionList first (includes camera metadata)
             detections = CameraDetectionList.deserialize(bytes(sample.payload))
-            with self._locks[camera_id]:
-                self._detections[camera_id] = detections
-                self._timestamps[camera_id] = time.time()
-                self.detection_counts[camera_id] += 1
+            self._store_detection(camera_id, detections)
         except Exception:
             try:
                 # Fall back to DetectionList (legacy format)
@@ -137,10 +156,48 @@ class DetectionService:
                     camera_orientation=cam_geom["orientation"],
                     detections=detections.detections
                 )
-                with self._locks[camera_id]:
-                    self._detections[camera_id] = cam_det
-                    self._timestamps[camera_id] = time.time()
-                    self.detection_counts[camera_id] += 1
+                self._store_detection(camera_id, cam_det)
+            except Exception:
+                pass
+
+    def _store_detection(self, camera_id: str, detections: CameraDetectionList) -> None:
+        """Cache detections, run tracking, and publish the resulting tracks."""
+        now = time.time()
+        with self._locks[camera_id]:
+            self._detections[camera_id] = detections
+            self._timestamps[camera_id] = now
+            self.detection_counts[camera_id] += 1
+
+        track_start = time.perf_counter()
+        tracks = self._trackers[camera_id].update(
+            detections.detections,
+            detections.image_width,
+            detections.image_height,
+            detections.timestamp_us / 1_000_000.0,
+        )
+        tracking_time_ms = (time.perf_counter() - track_start) * 1000.0
+        track_list = CameraTrackList(
+            timestamp_us=detections.timestamp_us,
+            frame_id=detections.frame_id,
+            image_width=detections.image_width,
+            image_height=detections.image_height,
+            tracking_time_ms=tracking_time_ms,
+            camera_id=detections.camera_id,
+            camera_position=detections.camera_position,
+            camera_orientation=detections.camera_orientation,
+            tracks=tracks,
+        )
+
+        with self._locks[camera_id]:
+            self._tracks[camera_id] = track_list
+            self._track_timestamps[camera_id] = now
+            self.track_counts[camera_id] += 1
+            self.tracker_latency_ms[camera_id] = tracking_time_ms
+
+        pub = self._track_publishers.get(camera_id)
+        if pub is not None:
+            try:
+                pub.put(track_list.serialize())
             except Exception:
                 pass
 
@@ -180,6 +237,75 @@ class DetectionService:
             if det:
                 result[camera_id] = det
         return result
+
+    def get_tracks(self, camera_id: str, max_age: float = 0.5) -> Optional[CameraTrackList]:
+        """
+        Get latest tracked objects from a specific camera.
+
+        Args:
+            camera_id: Camera identifier
+            max_age: Maximum age in seconds
+
+        Returns:
+            CameraTrackList or None if no recent tracks exist
+        """
+        if camera_id not in self._locks:
+            return None
+        with self._locks[camera_id]:
+            if self._tracks[camera_id] is None:
+                return None
+            if time.time() - self._track_timestamps[camera_id] > max_age:
+                return None
+            return self._tracks[camera_id]
+
+    def get_target_tracks(
+        self,
+        target_class: str,
+        max_age: float = 0.5,
+    ) -> Dict[str, List[TrackedObject]]:
+        """Get tracked objects of a target class from all cameras."""
+        result = {}
+        for camera_id in self.cameras:
+            track_list = self.get_tracks(camera_id, max_age)
+            if track_list:
+                matches = track_list.get_by_class(target_class)
+                if matches:
+                    result[camera_id] = matches
+        return result
+
+    def get_best_track(
+        self,
+        target_class: str,
+        max_age: float = 0.5,
+        track_id: Optional[int] = None,
+    ) -> tuple:
+        """
+        Get the best tracked object of a target class across all cameras.
+
+        If track_id is provided, only that persistent ID is considered.
+        """
+        best_camera = None
+        best_track = None
+        best_confidence = 0.0
+
+        for camera_id in self.cameras:
+            track_list = self.get_tracks(camera_id, max_age)
+            if not track_list:
+                continue
+
+            if track_id is not None:
+                track = track_list.get_by_track_id(track_id)
+                if track and track.class_name.lower() == target_class.lower():
+                    return (camera_id, track)
+                continue
+
+            track = track_list.get_best(target_class)
+            if track and track.confidence > best_confidence:
+                best_camera = camera_id
+                best_track = track
+                best_confidence = track.confidence
+
+        return (best_camera, best_track)
 
     def get_target_detections(
         self,
